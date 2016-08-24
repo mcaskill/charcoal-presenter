@@ -2,9 +2,9 @@
 
 namespace Charcoal\Presenter;
 
-use \ArrayAccess;
-use \InvalidArgumentException;
-use \Traversable;
+use InvalidArgumentException;
+use ArrayAccess;
+use Traversable;
 
 /**
  * Presenter provides a presentation and transformation layer for a "model".
@@ -18,36 +18,47 @@ use \Traversable;
 class Presenter
 {
     /**
+     * RegExp pattern for matching template tags.
+     *
+     * @const string
+     */
+    const MACRO_PATTERN = '~{{\s*(\w*?)\s*}}~';
+
+    /**
      * @var callable $transformer
      */
-    private $transformer;
+    protected $transformer;
 
     /**
      * @var string $getterPattern
      */
-    private $getterPattern;
+    protected $getterPattern;
 
     /**
-     * @param array|Traversable|callable $transformer   The data-view transformation array (or Traversable) object.
-     * @param string                     $getterPattern The string pattern to match string with. Must have a single catch-block.
+     * Return a new presenter object.
+     *
+     * @param mixed  $transformer   The data-view transformation array (or Traversable) object.
+     * @param string $getterPattern The string pattern to match string with. Must have a single catch-block.
      */
-    public function __construct($transformer, $getterPattern = '~{{(\w*?)}}~')
+    public function __construct($transformer, $getterPattern = self::MACRO_PATTERN)
     {
         $this->setTransformer($transformer);
         $this->getterPattern = $getterPattern;
     }
 
     /**
-     * @param array|Traversable|callable $transformer The data-view transformation array (or Traversable) object.
+     * Set the data-to-view transformer.
+     *
+     * @param  mixed $transformer The transformation array (or Traversable) object.
      * @throws InvalidArgumentException If the provided transformer is not valid.
      * @return void
      */
-    private function setTransformer($transformer)
+    protected function setTransformer($transformer)
     {
         if (is_callable($transformer)) {
             $this->transformer = $transformer;
-        } elseif (is_array($transformer) || $transformer instanceof Traversable) {
-            $this->transformer = function($model) use ($transformer) {
+        } elseif ($this->isTraversable($transformer)) {
+            $this->transformer = function ($model) use ($transformer) {
                 return $transformer;
             };
         } else {
@@ -58,40 +69,38 @@ class Presenter
     }
 
     /**
-     * TheT Transformer class is callable. Its purpose is to transform a model (object) into view data.
+     * Transform the given object.
+     *
+     * Its purpose is to transform a model (object) into view-data.
      *
      * The transformer is set from the constructor.
      *
-     * @param mixed $obj The original data (object / model) to transform into view-data.
+     * @param  mixed $obj The original data (object / model) to transform into view-data.
      * @return array Normalized data, suitable as presentation (view) layer
      */
     public function transform($obj)
     {
         $transformer = $this->transformer;
+
         return $this->transmogrify($obj, $transformer($obj));
     }
 
     /**
      * Transmogrify an object into an other structure.
      *
-     * @param mixed $obj Source object.
-     * @param mixed $val Modifier.
+     * @param  mixed $obj Source object.
+     * @param  mixed $val Modifier.
      * @throws InvalidArgumentException If the modifier is not callable, traversable (array) or string.
      * @return mixed The transformed data (type depends on modifier).
      */
-    private function transmogrify($obj, $val)
+    protected function transmogrify($obj, $val)
     {
-        // Callbacks (lambda or callable) are supported. They must accept the source object as argument.
-        if (is_callable($val)) {
-            return $val($obj);
-        }
-
         // Arrays or traversables are handled recursively.
         // This also converts / casts any Traversable into a simple array.
-        if (is_array($val) || $val instanceof Traversable) {
+        if ($this->isTraversable($val)) {
             $data = [];
             foreach ($val as $k => $v) {
-                if (!is_string($k)) {
+                if (!is_string($k) && is_string($v)) {
                     $data[$v] = $this->objectGet($obj, $v);
                 } else {
                     $data[$k] = $this->transmogrify($obj, $v);
@@ -100,52 +109,108 @@ class Presenter
             return $data;
         }
 
-        // Strings are handled by rendering {{property}} with dynamic object getter.
+        // Poor-man's Stringable
+        if (method_exists($val, '__toString')) {
+            $val = strval($val);
+        }
+
+        // Callables must accept the source object as an argument.
+        if (!is_string($val) && is_callable($val)) {
+            return $val($obj);
+        }
+
+        if (is_null($val)) {
+            return '';
+        }
+
+        if (is_bool($val)) {
+            return $val;
+        }
+
+        if (is_numeric($val)) {
+            return $val;
+        }
+
+        // Strings are handled by rendering `{{property}}` with dynamic object getter.
         if (is_string($val)) {
-            return preg_replace_callback($this->getterPattern, function(array $matches) use ($obj) {
-                return $this->objectGet($obj, $matches[1]);
-            }, $val);
+            return $this->renderPattern($obj, $val);
         }
 
         // Any other
         throw new InvalidArgumentException(
             sprintf(
-                'Transmogrify val needs to be callable, traversable (array) or a string. "%s" given.',
-                gettype($val)
+                'Transmogrify value needs to be callable, traversable (array), or stringable (string); "%s" given.',
+                (is_object($val) ? get_class($val) : gettype($val))
             )
         );
     }
 
     /**
-     * General-purpose dynamic object "getter".
+     * Simple pattern renderer.
      *
-     * This method tries to fetch a "property" from any type of object (or array),
-     * trying to figure out the best possible way:
+     * This method tries to fetch "tokens" from a given string and resolve their value
+     * from the object being presented.
      *
-     * - Method call (`$obj->property()`)
-     * - Public property get (`$obj->property`)
-     * - Array access, if available (`$obj[property]`)
-     * - Returns the property unchanged, otherwise
-     *
-     * @param mixed  $obj          The model (object or array) to retrieve the property's value from.
-     * @param string $propertyName The property name (key) to retrieve from model.
-     * @throws InvalidArgumentException If the property name is not a string.
-     * @return mixed The object property, if available. The property name, unchanged, if it's not available.
+     * @param  mixed  $obj     The model (object or array) to retrieve the property's value from.
+     * @param  string $pattern The string containing tokens to render.
+     * @return string The rendered pattern.
      */
-    private function objectGet($obj, $propertyName)
+    protected function renderPattern($obj, $pattern)
     {
-        if (is_callable([$obj, $propertyName])) {
-            return $obj->{$propertyName}();
+        return preg_replace_callback(
+            $this->getterPattern,
+            function(array $matches) use ($obj) {
+                return $this->objectGet($obj, $matches[1]);
+            },
+            $pattern
+        );
+    }
+
+    /**
+     * Get a value from an array or object.
+     *
+     * @param  mixed  $obj  The model (object or array) to retrieve the property's value from.
+     * @param  string $attr The attribute to retrieve from the model.
+     *     This could be a method, a public property, or an array index.
+     * @return mixed If available, returns the attribute's value. Otherwise, the attribute name, unchanged.
+     */
+    protected function objectGet($obj, $attr)
+    {
+        if ($this->isArrayable($obj) && isset($obj[$attr])) {
+            return $obj[$attr];
         }
 
-        if (isset($obj->{$propertyName})) {
-            return $obj->{$propertyName};
+        if (is_object($obj) && isset($obj->{$attr})) {
+            return $obj->{$attr};
         }
 
-        if ((is_array($obj) || $obj instanceof ArrayAccess) && isset($obj[$propertyName])) {
-            return $obj[$propertyName];
+        $method = [ $obj, $attr ];
+        if (is_callable($method)) {
+            return call_user_func($method);
         }
 
-        return $propertyName;
+        return $attr;
+    }
+
+    /**
+     * Determine whether the given value is array accessible.
+     *
+     * @param  mixed $value The variable being evaluated.
+     * @return boolean Returns TRUE if var is an arrayable, FALSE otherwise.
+     */
+    protected function isArrayable($value)
+    {
+        return (is_array($value) || $value instanceof ArrayAccess);
+    }
+
+    /**
+     * Determine whether the given value is array traversable.
+     *
+     * @param  mixed $value The variable being evaluated.
+     * @return boolean Returns TRUE if var is an traversable, FALSE otherwise.
+     */
+    protected function isTraversable($value)
+    {
+        return (is_array($value) || $value instanceof Traversable);
     }
 }
