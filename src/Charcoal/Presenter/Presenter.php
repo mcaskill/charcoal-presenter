@@ -101,11 +101,13 @@ class Presenter
             $data = [];
             foreach ($val as $k => $v) {
                 if (!is_string($k) && is_string($v)) {
-                    $data[$v] = $this->objectGet($obj, $v);
-                } else {
-                    $data[$k] = $this->transmogrify($obj, $v);
+                    $k = $v;
+                    $v = $this->objectGet($obj, $v);
                 }
+
+                $data[$k] = $this->transmogrify($obj, $v);
             }
+
             return $data;
         }
 
